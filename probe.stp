@@ -1,0 +1,37 @@
+#! /usr/bin/env stap
+
+// Debugging of error codes returned by the kernel via Systemtap.
+// sudo stap probe.stp kernel xsk_bind
+// On error, install debug symbols for kernel.
+
+global specs%
+global counts
+
+probe $1 . function(@2)  {
+  if (target() && !target_set_pid(pid())) next;
+  specs[tid()] = speculation()
+  counts["entry"] <<< 1
+}
+
+probe $1 . statement(@2 "@*:*") {
+  if (target() && !target_set_pid(pid())) next;
+
+  tokenize(pp(),"@");
+  fileline=tokenize("","@");
+  file=tokenize(fileline,":\"");
+  line=tokenize("",":\"");
+  printf("\n%s[%d] %s function(%s) file: %s line: %s\n", execname(), tid(), @1, @2, file, line);
+  speculate(specs[tid()], sprintf("%s[%d] %s:%s %s\n",
+                                  execname(), tid(), file, line,
+                                  %( $# >= 4
+                                     %? @4.": ".@choose_defined($4,"?")
+                                     %: "$$vars: ".$$vars %) ))
+  counts["statement"] <<< 1
+}
+
+probe end,error {
+  printf("\nstatistics:\n")
+  foreach (reason+ in counts) {
+    printf("%s count: %d\n", reason, @count(counts[reason]))
+  }
+}
