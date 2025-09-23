@@ -1,6 +1,6 @@
 use aya::maps::MapData;
 use std::borrow::BorrowMut;
-use std::fmt::Display;
+use std::fmt::{Debug, Display};
 use std::os::fd::AsRawFd;
 use std::sync::{Arc, Mutex};
 use tracing::info;

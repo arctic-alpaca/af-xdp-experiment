@@ -30,7 +30,7 @@ pub(crate) mod sealed {
 }
 
 pub trait Descriptor<'umem, Marker, const CHUNK_SIZE: usize>:
-    Debug + sealed::SealedDescriptorImpl<'umem, Marker, CHUNK_SIZE>
+    Debug + SealedDescriptorImpl<'umem, Marker, CHUNK_SIZE>
 where
     Marker: Debug,
 {
@@ -43,7 +43,7 @@ where
 {
 }
 
-impl<'umem, Marker, const CHUNK_SIZE: usize> sealed::SealedDescriptorImpl<'umem, Marker, CHUNK_SIZE>
+impl<'umem, Marker, const CHUNK_SIZE: usize> SealedDescriptorImpl<'umem, Marker, CHUNK_SIZE>
     for RxTxFrameDescriptor<'umem, Marker, CHUNK_SIZE>
 where
     Marker: Debug,
@@ -187,6 +187,13 @@ where
     marker: PhantomData<Marker>,
 }
 
+unsafe impl<'umem, Marker, const CHUNK_SIZE: usize> Send
+    for FillCompFrameDescriptor<'umem, Marker, CHUNK_SIZE>
+where
+    Marker: Debug,
+{
+}
+
 impl<'umem, Marker, const CHUNK_SIZE: usize> Descriptor<'umem, Marker, CHUNK_SIZE>
     for FillCompFrameDescriptor<'umem, Marker, CHUNK_SIZE>
 where
@@ -194,7 +201,7 @@ where
 {
 }
 
-impl<'umem, Marker, const CHUNK_SIZE: usize> sealed::SealedDescriptorImpl<'umem, Marker, CHUNK_SIZE>
+impl<'umem, Marker, const CHUNK_SIZE: usize> SealedDescriptorImpl<'umem, Marker, CHUNK_SIZE>
     for FillCompFrameDescriptor<'umem, Marker, CHUNK_SIZE>
 where
     Marker: Debug,

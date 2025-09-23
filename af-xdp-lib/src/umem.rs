@@ -5,7 +5,7 @@ use crate::umem_packet_desc::sealed::SealedDescriptorImpl;
 use crate::xsk_map::XskMap;
 use rustix::param::page_size;
 use std::alloc;
-use std::alloc::{GlobalAlloc, Layout, handle_alloc_error};
+use std::alloc::{Layout, handle_alloc_error};
 use std::any::TypeId;
 use std::collections::{HashMap, HashSet};
 use std::fmt::Debug;
@@ -42,6 +42,19 @@ where
     marker: PhantomData<Marker>,
 }
 
+unsafe impl<Marker, XM, const CHUNK_SIZE: usize> Send for Umem<Marker, XM, CHUNK_SIZE>
+where
+    Marker: Debug + 'static,
+    XM: XskMap,
+{
+}
+unsafe impl<Marker, XM, const CHUNK_SIZE: usize> Sync for Umem<Marker, XM, CHUNK_SIZE>
+where
+    Marker: Debug + 'static,
+    XM: XskMap,
+{
+}
+
 impl<Marker, XM, const CHUNK_SIZE: usize> Umem<Marker, XM, CHUNK_SIZE>
 where
     Marker: Debug + 'static,
@@ -64,14 +77,12 @@ where
 
         let memory = UmemMemory::new(chunk_number);
 
-        let socket = rustix::net::socket_with(
+        let socket = Arc::new(rustix::net::socket_with(
             rustix::net::AddressFamily::XDP,
             rustix::net::SocketType::RAW,
             rustix::net::SocketFlags::CLOEXEC,
             None,
-        )?;
-
-        let socket = Arc::new(socket);
+        )?);
 
         // Initialize umem as early as possible to rely on drop for cleanup.
         let umem = Self {
@@ -96,7 +107,6 @@ where
             tx_metadata_len: 0,
         };
 
-        // The first socket in socket_data_input is used to register UMEM.
         rustix::net::sockopt::set_xdp_umem_reg(socket.as_fd(), umem_reg)?;
 
         Ok(umem)
@@ -112,7 +122,7 @@ where
         })
     }
 
-    pub fn descriptors(&self) -> Option<Vec<FillCompFrameDescriptor<Marker, CHUNK_SIZE>>> {
+    pub fn descriptors(&'_ self) -> Option<Vec<FillCompFrameDescriptor<'_, Marker, CHUNK_SIZE>>> {
         if self.descriptors_given_out.swap(true, Ordering::AcqRel) {
             return None;
         }
@@ -129,11 +139,11 @@ where
     }
 
     pub fn rx_tx_only<const RING_SIZE: usize>(
-        &self,
+        &'_ self,
         net_device_id: DeviceId,
         queue_id: QueueId,
         map_index: u32,
-    ) -> Result<RxTXRings<Marker, XM, CHUNK_SIZE, RING_SIZE>, Error> {
+    ) -> Result<RxTXRings<'_, Marker, XM, CHUNK_SIZE, RING_SIZE>, Error> {
         if !self.initial_rings_given_out.load(Ordering::Acquire) {
             return Err(Error::Wip);
         }
@@ -160,11 +170,11 @@ where
     }
 
     pub fn rings<const RING_SIZE: usize>(
-        &self,
+        &'_ self,
         net_device_id: DeviceId,
         queue_id: QueueId,
         map_index: u32,
-    ) -> Result<Rings<Marker, XM, CHUNK_SIZE, RING_SIZE>, Error> {
+    ) -> Result<Rings<'_, Marker, XM, CHUNK_SIZE, RING_SIZE>, Error> {
         info!("rings");
 
         let socket = self.ring_socket();
@@ -253,7 +263,7 @@ impl<const CHUNK_SIZE: usize> UmemMemory<CHUNK_SIZE> {
         let page_size = page_size();
         let len = Self::size_internal(chunk_number);
         let layout = Layout::from_size_align(len, page_size).unwrap();
-        let umem_region = unsafe { alloc::System.alloc_zeroed(layout) };
+        let umem_region = unsafe { alloc::alloc_zeroed(layout) };
         if umem_region.is_null() {
             handle_alloc_error(layout);
         }
@@ -278,7 +288,7 @@ impl<const CHUNK_SIZE: usize> Drop for UmemMemory<CHUNK_SIZE> {
     fn drop(&mut self) {
         let layout = Layout::from_size_align(self.size(), page_size())
             .expect("Size and page size should have changed since new()");
-        unsafe { alloc::System.dealloc(self.memory.as_ptr(), layout) };
+        unsafe { alloc::dealloc(self.memory.as_ptr(), layout) };
     }
 }
 

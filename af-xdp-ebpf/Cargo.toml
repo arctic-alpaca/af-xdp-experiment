@@ -12,6 +12,8 @@ af-xdp-test-common = { path = "../af-xdp-ebpf-common" }
 name = "af-xdp-test"
 path = "src/main.rs"
 test = false
+bench = false
+
 
 [profile.dev]
 opt-level = 3

@@ -19,7 +19,7 @@ use aya_log::EbpfLogger;
 use mutnet::multi_step_parser::MultiStepParserResult;
 use rustix::net::{AddressFamily, SocketType};
 use tracing::debug;
-use tracing::{info, warn};
+use tracing::info;
 use tracing_subscriber::EnvFilter;
 
 const CHUNK_SIZE: usize = 4096;
@@ -70,12 +70,19 @@ async fn main() -> Result<(), anyhow::Error> {
             "../../target/bpfel-unknown-none/release/af-xdp-test"
         ))?;
 
-    if let Err(e) = EbpfLogger::init(&mut bpf) {
-        // This can happen if you remove all log statements from your eBPF program.
-        warn!("failed to initialize eBPF logger: {}", e);
-    }
+    let logger = EbpfLogger::init(&mut bpf).unwrap();
 
-    let veth = veth_netlink::VethPair::new(
+    let mut logger =
+        tokio::io::unix::AsyncFd::with_interest(logger, tokio::io::Interest::READABLE).unwrap();
+    tokio::task::spawn(async move {
+        loop {
+            let mut guard = logger.readable_mut().await.unwrap();
+            guard.get_inner_mut().flush();
+            guard.clear_ready();
+        }
+    });
+
+    let veth = VethPair::new(
         "ve_A".to_owned(),
         Ipv4Addr::new(10, 0, 0, 1),
         "ve_B".to_owned(),

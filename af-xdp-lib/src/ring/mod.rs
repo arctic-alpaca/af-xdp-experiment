@@ -127,11 +127,10 @@ where
     // TX: sendto
     // RX: recvmsg
     pub fn poke(&self) {
-        if let Some(flags) = self.flags() {
-            if flags == XdpRingFlags::XDP_RING_NEED_WAKEUP {
-                recvfrom::<_, &mut [u8; 0]>(self.socket.as_fd(), &mut [], RecvFlags::DONTWAIT)
-                    .unwrap();
-            }
+        if let Some(flags) = self.flags()
+            && flags == XdpRingFlags::XDP_RING_NEED_WAKEUP
+        {
+            recvfrom::<_, &mut [u8; 0]>(self.socket.as_fd(), &mut [], RecvFlags::DONTWAIT).unwrap();
         }
     }
 
@@ -170,21 +169,21 @@ where
     // TX: sendto
     // RX: recvmsg
     pub fn poke(&self) {
-        if let Some(flags) = self.flags() {
-            if flags == XdpRingFlags::XDP_RING_NEED_WAKEUP {
-                let sockaddr_xdp = SocketAddrXdp::new(
-                    // Not used in sendmsg for XDP.
-                    // https://github.com/torvalds/linux/blob/v6.10/net/xdp/xsk.c#L905-L948
-                    rustix::net::xdp::SocketAddrXdpFlags::empty(),
-                    // Not used in sendmsg for XDP.
-                    // https://github.com/torvalds/linux/blob/v6.10/net/xdp/xsk.c#L905-L948
-                    0,
-                    // Not used in sendmsg for XDP.
-                    // https://github.com/torvalds/linux/blob/v6.10/net/xdp/xsk.c#L905-L948
-                    0,
-                );
-                sendto(self.socket.as_fd(), &[], SendFlags::DONTWAIT, &sockaddr_xdp).unwrap();
-            }
+        if let Some(flags) = self.flags()
+            && flags == XdpRingFlags::XDP_RING_NEED_WAKEUP
+        {
+            let sockaddr_xdp = SocketAddrXdp::new(
+                // Not used in sendmsg for XDP.
+                // https://github.com/torvalds/linux/blob/v6.10/net/xdp/xsk.c#L905-L948
+                rustix::net::xdp::SocketAddrXdpFlags::empty(),
+                // Not used in sendmsg for XDP.
+                // https://github.com/torvalds/linux/blob/v6.10/net/xdp/xsk.c#L905-L948
+                0,
+                // Not used in sendmsg for XDP.
+                // https://github.com/torvalds/linux/blob/v6.10/net/xdp/xsk.c#L905-L948
+                0,
+            );
+            sendto(self.socket.as_fd(), &[], SendFlags::DONTWAIT, &sockaddr_xdp).unwrap();
         }
     }
 }
@@ -222,14 +221,13 @@ where
     // TX: sendto
     // RX: recvmsg
     pub fn poke(&self) {
-        if let Some(flags) = self.flags() {
-            if flags == XdpRingFlags::XDP_RING_NEED_WAKEUP {
-                // The wakeup flag in the fill ring means we need to wake up the RX ring:
-                // https://github.com/torvalds/linux/commit/77cd0d7b3f257fd0e3096b4fdcff1a7d38e99e10
-                // This means we can use recvfrom like in the RX ring.
-                recvfrom::<_, &mut [u8; 0]>(self.socket.as_fd(), &mut [], RecvFlags::DONTWAIT)
-                    .unwrap();
-            }
+        if let Some(flags) = self.flags()
+            && flags == XdpRingFlags::XDP_RING_NEED_WAKEUP
+        {
+            // The wakeup flag in the fill ring means we need to wake up the RX ring:
+            // https://github.com/torvalds/linux/commit/77cd0d7b3f257fd0e3096b4fdcff1a7d38e99e10
+            // This means we can use recvfrom like in the RX ring.
+            recvfrom::<_, &mut [u8; 0]>(self.socket.as_fd(), &mut [], RecvFlags::DONTWAIT).unwrap();
         }
     }
 }
