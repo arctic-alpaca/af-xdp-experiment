@@ -1,63 +1,70 @@
-mod inner;
+mod memory;
 
+use crate::descriptor::{Descriptor, FillCompFrameDescriptor, RxTxFrameDescriptor};
 use crate::error::Error;
-use crate::umem_packet_desc::{Descriptor, FillCompFrameDescriptor, RxTxFrameDescriptor};
-use crate::xsk_map::XskMapEntry;
-use crate::xsk_map::{SetElementError, XskMap};
-use inner::InnerRing;
-use rustix::io::Errno;
-use rustix::mm::munmap;
+use crate::ring::memory::RingMemory;
+use crate::umem::memory::UmemMemory;
+use rustix::net::sockopt::{
+    set_xdp_rx_ring_size, set_xdp_tx_ring_size, set_xdp_umem_completion_ring_size,
+    set_xdp_umem_fill_ring_size, xdp_mmap_offsets, xdp_options, xdp_statistics,
+};
 use rustix::net::xdp::{
-    SocketAddrXdp, XDP_PGOFF_RX_RING, XDP_PGOFF_TX_RING, XDP_UMEM_PGOFF_COMPLETION_RING,
-    XDP_UMEM_PGOFF_FILL_RING, XdpMmapOffsets, XdpRingFlags, XdpRingOffset,
+    SocketAddrXdp, SocketAddrXdpFlags, XDP_PGOFF_RX_RING, XDP_PGOFF_TX_RING,
+    XDP_UMEM_PGOFF_COMPLETION_RING, XDP_UMEM_PGOFF_FILL_RING, XdpOptionsFlags, XdpRingFlags,
+    XdpRingOffset, XdpStatistics,
 };
 use rustix::net::{RecvFlags, SendFlags, recvfrom, sendto};
-use std::ffi::c_void;
 use std::fmt::Debug;
 use std::marker::PhantomData;
-use std::os::fd::{AsFd, BorrowedFd, OwnedFd};
-use std::ptr::NonNull;
-use std::sync::atomic::AtomicU32;
-use std::sync::{Arc, Mutex};
-use tracing::info;
+use std::os::fd::{AsFd, OwnedFd};
+use std::sync::Arc;
+use tracing::{info, trace, warn};
 
 /// https://github.com/xdp-project/xdp-tools/blob/master/headers/xdp/xsk.h#L32
 /// https://github.com/torvalds/linux/blob/master/net/xdp/xsk_queue.h
-#[derive(Debug)]
 pub struct Ring<
     'umem,
-    // Ring type
-    RT,
+    RingType,
     FrameDescriptor,
     Marker,
-    // XSK map
-    XM,
     const CHUNK_SIZE: usize,
     const RING_SIZE: usize,
 > where
     FrameDescriptor: Descriptor<'umem, Marker, CHUNK_SIZE> + Debug,
-    Marker: Debug,
-    XM: XskMap,
 {
-    // Drop the inner ring before the ring memory to avoid dangling pointers.
-    ring: InnerRing<'umem, FrameDescriptor, Marker, CHUNK_SIZE, RING_SIZE>,
-    // Drop the map entry before the ring memory to ensure the socket is removed from the XSKMAP before the memory is unmapped.
-    map_entry: Option<XskMapEntry<XM>>,
-    _ring_memory: RingMemory,
+    ring_memory: RingMemory<'umem, Marker, FrameDescriptor, CHUNK_SIZE, RING_SIZE>,
+    umem_memory: &'umem UmemMemory,
     socket: Arc<OwnedFd>,
-    ring_type: PhantomData<RT>,
+    ring_type: PhantomData<RingType>,
     marker: PhantomData<Marker>,
 }
 
 // Safety:
 // Ring is not Send because NonNull has no guarantees to make it Send.
 // The pointers are never altered, and the pointed to memory/values are safe to exclusively access from other threads.
-unsafe impl<'umem, RT, FrameDescriptor, Marker, XM, const CHUNK_SIZE: usize, const RING_SIZE: usize>
-    Send for Ring<'umem, RT, FrameDescriptor, Marker, XM, CHUNK_SIZE, RING_SIZE>
+unsafe impl<
+    'umem,
+    RingType,
+    FrameDescriptor,
+    Marker,
+    const CHUNK_SIZE: usize,
+    const RING_SIZE: usize,
+> Send for Ring<'umem, RingType, FrameDescriptor, Marker, CHUNK_SIZE, RING_SIZE>
 where
     FrameDescriptor: Descriptor<'umem, Marker, CHUNK_SIZE> + Debug,
-    Marker: Debug,
-    XM: XskMap,
+{
+}
+
+unsafe impl<
+    'umem,
+    RingType,
+    FrameDescriptor,
+    Marker,
+    const CHUNK_SIZE: usize,
+    const RING_SIZE: usize,
+> Sync for Ring<'umem, RingType, FrameDescriptor, Marker, CHUNK_SIZE, RING_SIZE>
+where
+    FrameDescriptor: Descriptor<'umem, Marker, CHUNK_SIZE> + Debug,
 {
 }
 
@@ -66,56 +73,45 @@ pub struct Consumer;
 #[derive(Debug, Ord, PartialOrd, Eq, PartialEq, Hash, Copy, Clone)]
 pub struct Producer;
 
-pub type RxRing<'umem, Marker, XM, const CHUNK_SIZE: usize, const RING_SIZE: usize> = Ring<
+pub type RxRing<'umem, Marker, const CHUNK_SIZE: usize, const RING_SIZE: usize> = Ring<
     'umem,
     Consumer,
     RxTxFrameDescriptor<'umem, Marker, CHUNK_SIZE>,
     Marker,
-    XM,
     CHUNK_SIZE,
     RING_SIZE,
 >;
-pub type TxRing<'umem, Marker, XM, const CHUNK_SIZE: usize, const RING_SIZE: usize> = Ring<
+pub type TxRing<'umem, Marker, const CHUNK_SIZE: usize, const RING_SIZE: usize> = Ring<
     'umem,
     Producer,
     RxTxFrameDescriptor<'umem, Marker, CHUNK_SIZE>,
     Marker,
-    XM,
     CHUNK_SIZE,
     RING_SIZE,
 >;
-pub type CompletionRing<'umem, Marker, XM, const CHUNK_SIZE: usize, const RING_SIZE: usize> = Ring<
+pub type CompletionRing<'umem, Marker, const CHUNK_SIZE: usize, const RING_SIZE: usize> = Ring<
     'umem,
     Consumer,
     FillCompFrameDescriptor<'umem, Marker, CHUNK_SIZE>,
     Marker,
-    XM,
     CHUNK_SIZE,
     RING_SIZE,
 >;
-pub type FillRing<'umem, Marker, XM, const CHUNK_SIZE: usize, const RING_SIZE: usize> = Ring<
+pub type FillRing<'umem, Marker, const CHUNK_SIZE: usize, const RING_SIZE: usize> = Ring<
     'umem,
     Producer,
     FillCompFrameDescriptor<'umem, Marker, CHUNK_SIZE>,
     Marker,
-    XM,
     CHUNK_SIZE,
     RING_SIZE,
 >;
 
-fn get_offsets(socket_fd: impl AsFd) -> Result<XdpMmapOffsets, Errno> {
-    rustix::net::sockopt::xdp_mmap_offsets(socket_fd)
-}
-
-impl<Marker, XM, const CHUNK_SIZE: usize, const RING_SIZE: usize>
-    RxRing<'_, Marker, XM, CHUNK_SIZE, RING_SIZE>
-where
-    Marker: Debug,
-    XM: XskMap,
+impl<'umem, Marker, const CHUNK_SIZE: usize, const RING_SIZE: usize>
+    RxRing<'umem, Marker, CHUNK_SIZE, RING_SIZE>
 {
-    pub fn new(umem_memory: NonNull<u8>, socket: Arc<OwnedFd>) -> Result<Self, Error> {
-        rustix::net::sockopt::set_xdp_rx_ring_size(socket.as_fd(), RING_SIZE as u32)?;
-        let offsets = get_offsets(socket.as_fd())?.rx;
+    pub(crate) fn new(umem_memory: &'umem UmemMemory, socket: Arc<OwnedFd>) -> Result<Self, Error> {
+        set_xdp_rx_ring_size(socket.as_fd(), RING_SIZE as u32)?;
+        let offsets = xdp_mmap_offsets(socket.as_fd())?.rx;
         RxRing::internal_new(offsets, XDP_PGOFF_RX_RING, umem_memory, socket)
     }
 
@@ -133,31 +129,14 @@ where
             recvfrom::<_, &mut [u8; 0]>(self.socket.as_fd(), &mut [], RecvFlags::DONTWAIT).unwrap();
         }
     }
-
-    pub(crate) fn register(
-        &mut self,
-        xsk_map: Arc<Mutex<XM>>,
-        xsk_map_index: u32,
-    ) -> Result<(), SetElementError> {
-        info!("registering in map");
-        self.map_entry = Some(XskMapEntry::new(
-            xsk_map,
-            xsk_map_index,
-            self.socket.clone(),
-        )?);
-        Ok(())
-    }
 }
 
-impl<Marker, XM, const CHUNK_SIZE: usize, const RING_SIZE: usize>
-    TxRing<'_, Marker, XM, CHUNK_SIZE, RING_SIZE>
-where
-    Marker: Debug,
-    XM: XskMap,
+impl<'umem, Marker, const CHUNK_SIZE: usize, const RING_SIZE: usize>
+    TxRing<'umem, Marker, CHUNK_SIZE, RING_SIZE>
 {
-    pub fn new(umem_memory: NonNull<u8>, socket: Arc<OwnedFd>) -> Result<Self, Error> {
-        rustix::net::sockopt::set_xdp_tx_ring_size(socket.as_fd(), RING_SIZE as u32)?;
-        let offsets = get_offsets(socket.as_fd())?.tx;
+    pub(crate) fn new(umem_memory: &'umem UmemMemory, socket: Arc<OwnedFd>) -> Result<Self, Error> {
+        set_xdp_tx_ring_size(socket.as_fd(), RING_SIZE as u32)?;
+        let offsets = xdp_mmap_offsets(socket.as_fd())?.tx;
         TxRing::internal_new(offsets, XDP_PGOFF_TX_RING, umem_memory, socket)
     }
 
@@ -175,7 +154,7 @@ where
             let sockaddr_xdp = SocketAddrXdp::new(
                 // Not used in sendmsg for XDP.
                 // https://github.com/torvalds/linux/blob/v6.10/net/xdp/xsk.c#L905-L948
-                rustix::net::xdp::SocketAddrXdpFlags::empty(),
+                SocketAddrXdpFlags::empty(),
                 // Not used in sendmsg for XDP.
                 // https://github.com/torvalds/linux/blob/v6.10/net/xdp/xsk.c#L905-L948
                 0,
@@ -188,28 +167,22 @@ where
     }
 }
 
-impl<Marker, XM, const CHUNK_SIZE: usize, const RING_SIZE: usize>
-    CompletionRing<'_, Marker, XM, CHUNK_SIZE, RING_SIZE>
-where
-    Marker: Debug,
-    XM: XskMap,
+impl<'umem, Marker, const CHUNK_SIZE: usize, const RING_SIZE: usize>
+    CompletionRing<'umem, Marker, CHUNK_SIZE, RING_SIZE>
 {
-    pub(crate) fn new(umem_memory: NonNull<u8>, socket: Arc<OwnedFd>) -> Result<Self, Error> {
-        rustix::net::sockopt::set_xdp_umem_completion_ring_size(socket.as_fd(), RING_SIZE as u32)?;
-        let offsets = get_offsets(socket.as_fd())?.cr;
+    pub(crate) fn new(umem_memory: &'umem UmemMemory, socket: Arc<OwnedFd>) -> Result<Self, Error> {
+        set_xdp_umem_completion_ring_size(socket.as_fd(), RING_SIZE as u32)?;
+        let offsets = xdp_mmap_offsets(socket.as_fd())?.cr;
         CompletionRing::internal_new(offsets, XDP_UMEM_PGOFF_COMPLETION_RING, umem_memory, socket)
     }
 }
 
-impl<Marker, XM, const CHUNK_SIZE: usize, const RING_SIZE: usize>
-    FillRing<'_, Marker, XM, CHUNK_SIZE, RING_SIZE>
-where
-    Marker: Debug,
-    XM: XskMap,
+impl<'umem, Marker, const CHUNK_SIZE: usize, const RING_SIZE: usize>
+    FillRing<'umem, Marker, CHUNK_SIZE, RING_SIZE>
 {
-    pub(crate) fn new(umem_memory: NonNull<u8>, socket: Arc<OwnedFd>) -> Result<Self, Error> {
-        rustix::net::sockopt::set_xdp_umem_fill_ring_size(socket.as_fd(), RING_SIZE as u32)?;
-        let offsets = get_offsets(socket.as_fd())?.fr;
+    pub(crate) fn new(umem_memory: &'umem UmemMemory, socket: Arc<OwnedFd>) -> Result<Self, Error> {
+        set_xdp_umem_fill_ring_size(socket.as_fd(), RING_SIZE as u32)?;
+        let offsets = xdp_mmap_offsets(socket.as_fd())?.fr;
         FillRing::internal_new(offsets, XDP_UMEM_PGOFF_FILL_RING, umem_memory, socket)
     }
 
@@ -232,160 +205,135 @@ where
     }
 }
 
-impl<'umem, FrameDescriptor, Marker, XM, const CHUNK_SIZE: usize, const RING_SIZE: usize>
-    Ring<'umem, Producer, FrameDescriptor, Marker, XM, CHUNK_SIZE, RING_SIZE>
+impl<'umem, FrameDescriptor, Marker, const CHUNK_SIZE: usize, const RING_SIZE: usize>
+    Ring<'umem, Producer, FrameDescriptor, Marker, CHUNK_SIZE, RING_SIZE>
 where
     FrameDescriptor: Descriptor<'umem, Marker, CHUNK_SIZE> + Debug,
-    Marker: Debug,
-    XM: XskMap,
 {
     pub fn push(&mut self, input: FrameDescriptor) -> Result<(), FrameDescriptor> {
-        self.ring.push(input)
+        trace!("Pushing {:?}.", &input);
+
+        if !self.is_full() {
+            let producer = self.ring_memory.producer();
+
+            unsafe {
+                self.ring_memory
+                    .write_descriptor(producer as usize, input.into_ring_repr())
+            };
+
+            self.ring_memory.set_producer(producer.wrapping_add(1));
+
+            Ok(())
+        } else {
+            warn!("Pushing failed, ring full: {:?}", &input);
+            Err(input)
+        }
     }
 }
 
-impl<'umem, FrameDescriptor, Marker, XM, const CHUNK_SIZE: usize, const RING_SIZE: usize>
-    Ring<'umem, Consumer, FrameDescriptor, Marker, XM, CHUNK_SIZE, RING_SIZE>
+impl<'umem, FrameDescriptor, Marker, const CHUNK_SIZE: usize, const RING_SIZE: usize>
+    Ring<'umem, Consumer, FrameDescriptor, Marker, CHUNK_SIZE, RING_SIZE>
 where
     FrameDescriptor: Descriptor<'umem, Marker, CHUNK_SIZE> + Debug,
-    Marker: Debug,
-    XM: XskMap,
 {
     pub fn pop(&mut self) -> Option<FrameDescriptor> {
-        self.ring.pop()
+        trace!("Popping.");
+        if !self.is_empty() {
+            let consumer = self.ring_memory.consumer();
+
+            let desc = FrameDescriptor::from_ring_repr(
+                unsafe { self.ring_memory.read_descriptor(consumer as usize) },
+                self.umem_memory,
+            );
+
+            self.ring_memory.set_consumer(consumer.wrapping_add(1));
+
+            Some(desc)
+        } else {
+            warn!("Popping failed, the ring is empty.");
+            None
+        }
     }
 }
 
-impl<'umem, RT, FrameDescriptor, Marker, XM, const CHUNK_SIZE: usize, const RING_SIZE: usize>
-    Ring<'umem, RT, FrameDescriptor, Marker, XM, CHUNK_SIZE, RING_SIZE>
+impl<'umem, RingType, FrameDescriptor, Marker, const CHUNK_SIZE: usize, const RING_SIZE: usize>
+    Ring<'umem, RingType, FrameDescriptor, Marker, CHUNK_SIZE, RING_SIZE>
 where
     FrameDescriptor: Descriptor<'umem, Marker, CHUNK_SIZE> + Debug,
-    Marker: Debug,
-    XM: XskMap,
 {
     fn internal_new(
         offsets: XdpRingOffset,
         mmap_offset: u64,
-        umem_memory: NonNull<u8>,
+        umem_memory: &'umem UmemMemory,
         socket: Arc<OwnedFd>,
-    ) -> Result<Ring<'umem, RT, FrameDescriptor, Marker, XM, CHUNK_SIZE, RING_SIZE>, Error> {
+    ) -> Result<Ring<'umem, RingType, FrameDescriptor, Marker, CHUNK_SIZE, RING_SIZE>, Error> {
         const {
-            assert!(RING_SIZE as u32 <= u32::MAX >> 1);
-            assert!(RING_SIZE.is_power_of_two());
+            assert!(
+                RING_SIZE as u32 <= u32::MAX >> 1,
+                "RING_SIZE may not be larger than u32::MAX >> 1 to allow overflow"
+            );
+            assert!(
+                RING_SIZE.is_power_of_two(),
+                "RING_SIZE must be a power of two"
+            );
         }
+
         info!("Offsets: {offsets:?}");
 
-        let mmap_len = Self::mmap_len(offsets.desc as usize);
-
-        let ring_memory = RingMemory::new(mmap_len, socket.as_fd(), mmap_offset)?;
-
-        let ring = InnerRing::new(
-            ring_memory.producer(&offsets)?,
-            ring_memory.consumer(&offsets)?,
-            ring_memory.descriptors::<FrameDescriptor, Marker, CHUNK_SIZE, RING_SIZE>(&offsets)?,
-            ring_memory.flags(&offsets)?,
-            umem_memory,
-        );
+        let ring_memory = RingMemory::new(socket.as_fd(), mmap_offset, offsets)?;
 
         Ok(Ring {
-            ring,
-            _ring_memory: ring_memory,
+            ring_memory,
+            umem_memory,
             socket,
-            map_entry: None,
             ring_type: PhantomData,
             marker: PhantomData,
         })
     }
 
+    pub fn statistics(&self) -> Result<XdpStatistics, Error> {
+        Ok(xdp_statistics(&self.socket)?)
+    }
+
+    pub fn options(&self) -> Result<XdpOptionsFlags, Error> {
+        Ok(xdp_options(&self.socket)?)
+    }
+
+    pub fn is_zero_copy(&self) -> Result<bool, Error> {
+        let option_flags = xdp_options(&self.socket)?;
+        Ok(option_flags.contains(XdpOptionsFlags::XDP_OPTIONS_ZEROCOPY))
+    }
+
     pub fn flags(&self) -> Option<XdpRingFlags> {
-        self.ring.flags()
+        self.ring_memory.flags()
     }
 
     pub fn needs_wakeup(&self) -> bool {
-        self.ring.needs_wakeup()
-    }
-
-    pub fn free_entries(&self) -> u32 {
-        self.ring.free_entries()
-    }
-
-    pub fn filled_entries(&self) -> u32 {
-        self.ring.filled_entries()
-    }
-
-    pub fn is_empty(&self) -> bool {
-        self.ring.is_empty()
-    }
-
-    pub fn is_full(&self) -> bool {
-        self.ring.is_full()
-    }
-
-    fn mmap_len(descriptors_offset: usize) -> usize {
-        descriptors_offset + RING_SIZE * size_of::<FrameDescriptor>()
-    }
-}
-
-#[derive(Debug)]
-pub(crate) struct RingMemory {
-    address: NonNull<c_void>,
-    size: usize,
-}
-
-impl RingMemory {
-    pub(crate) fn new(size: usize, socket: BorrowedFd, offset: u64) -> Result<Self, Error> {
-        let address = unsafe {
-            rustix::mm::mmap(
-                std::ptr::null_mut(),
-                size,
-                rustix::mm::ProtFlags::READ | rustix::mm::ProtFlags::WRITE,
-                rustix::mm::MapFlags::SHARED | rustix::mm::MapFlags::POPULATE,
-                socket,
-                offset,
-            )
-        }?;
-        let address = NonNull::new(address).ok_or(Error::Wip).inspect_err(|_| {
-            unsafe { munmap(address, size) }.unwrap();
-        })?;
-        Ok(Self { address, size })
-    }
-
-    pub(crate) fn producer(&self, offsets: &XdpRingOffset) -> Result<NonNull<AtomicU32>, Error> {
-        let producer = unsafe { self.address.as_ptr().byte_add(offsets.producer as usize) };
-        NonNull::new(producer.cast()).ok_or(Error::Wip)
-    }
-
-    pub(crate) fn consumer(&self, offsets: &XdpRingOffset) -> Result<NonNull<AtomicU32>, Error> {
-        let consumer = unsafe { self.address.as_ptr().byte_add(offsets.consumer as usize) };
-        NonNull::new(consumer.cast()).ok_or(Error::Wip)
-    }
-
-    pub(crate) fn flags(&self, offsets: &XdpRingOffset) -> Result<Option<NonNull<u32>>, Error> {
-        if let Some(flags) = offsets.flags {
-            let flags = unsafe { self.address.as_ptr().byte_add(flags as usize) };
-            Ok(Some(NonNull::new(flags).unwrap().cast()))
+        if let Some(flags) = self.flags() {
+            flags.contains(XdpRingFlags::XDP_RING_NEED_WAKEUP)
         } else {
-            Ok(None)
+            false
         }
     }
 
-    pub(crate) fn descriptors<
-        'umem,
-        FrameDescriptor: Descriptor<'umem, Marker, CHUNK_SIZE>,
-        Marker: Debug,
-        const CHUNK_SIZE: usize,
-        const RING_SIZE: usize,
-    >(
-        &self,
-        offsets: &XdpRingOffset,
-    ) -> Result<NonNull<[FrameDescriptor::RingType; RING_SIZE]>, Error> {
-        NonNull::new(unsafe { self.address.as_ptr().byte_add(offsets.desc as usize).cast() })
-            .ok_or(Error::Wip)
+    pub fn free_entries(&self) -> u32 {
+        self.ring_memory
+            .consumer()
+            .wrapping_add(RING_SIZE as u32)
+            .wrapping_sub(self.ring_memory.producer())
     }
-}
 
-impl Drop for RingMemory {
-    fn drop(&mut self) {
-        unsafe { munmap(self.address.as_ptr(), self.size) }.unwrap()
+    pub fn filled_entries(&self) -> u32 {
+        self.ring_memory
+            .producer()
+            .wrapping_sub(self.ring_memory.consumer())
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.ring_memory.producer() == self.ring_memory.consumer()
+    }
+
+    pub fn is_full(&self) -> bool {
+        self.filled_entries() == RING_SIZE as u32
     }
 }

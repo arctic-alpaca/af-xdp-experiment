@@ -8,41 +8,55 @@ use std::os::fd::{AsFd, AsRawFd};
 use std::path::{Path, PathBuf};
 
 use ethtool::EthtoolHandle;
+use rustix::thread::move_into_link_name_space;
 use std::thread;
-
 use tracing::info;
 
 pub const NETNS_PATH: &str = "/run/netns/";
 
+pub struct VethConfig {
+    pub name: String,
+    pub ip: Ipv4Addr,
+    pub rx_count: u32,
+    pub tx_count: u32,
+}
+
+impl VethConfig {
+    pub fn new(name: String, ip: Ipv4Addr, rx_count: u32, tx_count: u32) -> Self {
+        Self {
+            name,
+            ip,
+            rx_count,
+            tx_count,
+        }
+    }
+}
+
 pub struct VethPair {
     pub outside_veth_name: String,
-    netns_name: String,
-    netns_file_path: PathBuf,
-    outside_veth_ip: Ipv4Addr,
-    namespaced_veth_ip: Ipv4Addr,
+    pub namespaced_veth_name: String,
+    pub netns_name: String,
+    pub netns_file_path: PathBuf,
+    pub outside_veth_ip: Ipv4Addr,
+    pub namespaced_veth_ip: Ipv4Addr,
 }
 
 #[allow(clippy::too_many_arguments)]
 impl VethPair {
     pub async fn new(
-        outside_veth_name: String,
-        outside_veth_ip: Ipv4Addr,
-        namespaced_veth_name: String,
-        namespaced_veth_ip: Ipv4Addr,
         netns_name: String,
-        outside_veth_rx_count: u32,
-        outside_veth_tx_count: u32,
-        namespaced_veth_rx_count: u32,
-        namespaced_veth_tx_count: u32,
+        outside_veth: VethConfig,
+        namespaced_veth: VethConfig,
     ) -> Self {
         let netns_file_path = Self::create_netns(&netns_name).await;
 
         let veth_pair = Self {
-            outside_veth_name: outside_veth_name.clone(),
+            outside_veth_name: outside_veth.name.clone(),
+            namespaced_veth_name: outside_veth.name.clone(),
             netns_name,
             netns_file_path: netns_file_path.clone(),
-            outside_veth_ip,
-            namespaced_veth_ip,
+            outside_veth_ip: outside_veth.ip,
+            namespaced_veth_ip: namespaced_veth.ip,
         };
 
         let (connection, handle, _) = rtnetlink::new_connection().unwrap();
@@ -51,21 +65,21 @@ impl VethPair {
             Self::open_connection_in_netns(netns_file_path.clone(), rtnetlink::new_connection)
                 .await;
 
-        Self::create_veths(&outside_veth_name, &namespaced_veth_name, &handle).await;
+        Self::create_veths(&outside_veth.name, &namespaced_veth.name, &handle).await;
 
         let (outside_veth_index, outside_veth_mac) =
-            Self::get_if_index(&outside_veth_name, &handle)
+            Self::get_if_index(&outside_veth.name, &handle)
                 .await
                 .unwrap();
         let (namespaced_veth_index, _namespaced_veth_mac) =
-            Self::get_if_index(&namespaced_veth_name, &handle)
+            Self::get_if_index(&namespaced_veth.name, &handle)
                 .await
                 .unwrap();
 
-        Self::move_veth_into_netns(&namespaced_veth_name, &netns_file_path, &handle).await;
-        Self::add_address(outside_veth_index, outside_veth_ip, &handle).await;
+        Self::move_veth_into_netns(&namespaced_veth.name, &netns_file_path, &handle).await;
+        Self::add_address(outside_veth_index, outside_veth.ip, &handle).await;
 
-        Self::add_address(namespaced_veth_index, namespaced_veth_ip, &netns_handle).await;
+        Self::add_address(namespaced_veth_index, namespaced_veth.ip, &netns_handle).await;
 
         Self::set_up(outside_veth_index, &handle).await;
         Self::set_up(namespaced_veth_index, &netns_handle).await;
@@ -73,12 +87,12 @@ impl VethPair {
         Self::add_neighbour(
             namespaced_veth_index,
             &outside_veth_mac,
-            outside_veth_ip,
+            outside_veth.ip,
             &netns_handle,
         )
         .await;
 
-        Self::add_default_route(outside_veth_ip, &netns_handle).await;
+        Self::add_default_route(outside_veth.ip, &netns_handle).await;
 
         let (connection, mut eth_handle, _) = ethtool::new_connection().unwrap();
         tokio::spawn(connection);
@@ -87,17 +101,17 @@ impl VethPair {
             Self::open_connection_in_netns(netns_file_path, ethtool::new_connection).await;
 
         Self::set_rx_tx_channels(
-            &outside_veth_name,
-            outside_veth_rx_count,
-            outside_veth_tx_count,
+            &outside_veth.name,
+            outside_veth.rx_count,
+            outside_veth.tx_count,
             &mut eth_handle,
         )
         .await;
 
         Self::set_rx_tx_channels(
-            &namespaced_veth_name,
-            namespaced_veth_rx_count,
-            namespaced_veth_tx_count,
+            &namespaced_veth.name,
+            namespaced_veth.rx_count,
+            namespaced_veth.tx_count,
             &mut netns_eth_handle,
         )
         .await;
@@ -200,8 +214,7 @@ impl VethPair {
             .match_name(if_name.to_owned())
             .execute()
             .try_next()
-            .await
-            .unwrap()
+            .await?
             .unwrap();
         let index = info.header.index;
         let mac = info
@@ -233,7 +246,7 @@ impl VethPair {
             let netns_file = File::open(netns_file_path).unwrap();
 
             // Move the thread into the network namespace.
-            rustix::thread::move_into_link_name_space(netns_file.as_fd(), None).unwrap();
+            move_into_link_name_space(netns_file.as_fd(), None).unwrap();
 
             // The connection socket must be created in the context of the Tokio runtime.
             let _guard = tokio_runtime_handle.enter();
@@ -245,13 +258,13 @@ impl VethPair {
         .unwrap()
     }
 
-    pub(crate) fn send_from_ns(&self, send_from_port: u16, send_to_port: u16, payload: Vec<u8>) {
+    pub fn send_from_ns(&self, send_from_port: u16, send_to_port: u16, payload: Vec<u8>) {
         let netns_file_path = self.netns_file_path.clone();
         let outside_veth_ip = self.outside_veth_ip;
         let namespaced_veth_ip = self.namespaced_veth_ip;
         thread::spawn(move || {
             let file = File::open(netns_file_path).unwrap();
-            rustix::thread::move_into_link_name_space(file.as_fd(), None).unwrap();
+            move_into_link_name_space(file.as_fd(), None).unwrap();
 
             let sock = UdpSocket::bind(SocketAddr::new(namespaced_veth_ip.into(), send_from_port))
                 .unwrap();

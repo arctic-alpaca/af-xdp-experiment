@@ -2,7 +2,7 @@ use crate::xsk_map::SetElementError;
 use rustix::io::Errno;
 use std::fmt::{Debug, Display, Formatter};
 
-#[derive(Debug)]
+#[derive(Debug, Eq, PartialEq, Hash, Clone)]
 pub enum Error {
     Rustix(Errno),
     MarkerAlreadyUsed,

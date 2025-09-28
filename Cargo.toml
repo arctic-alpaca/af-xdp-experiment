@@ -1,5 +1,3 @@
 [workspace]
 members = ["xtask", "af-xdp-ebpf-common", "af-xdp-lib"]
 resolver = "3"
-
-

@@ -17,7 +17,6 @@ tokio = { version = "1.47.1", features = ["macros", "rt", "rt-multi-thread", "ne
 futures = "0.3.31"
 rustix = { version = "1.1.2", features = ["net", "mm", "param", "event", "thread"] }
 anyhow = "1.0.100"
-libc = "0.2.175"
 mutnet = "0.7.0"
 aya = { git = "https://github.com/aya-rs/aya" }
 aya-log = { git = "https://github.com/aya-rs/aya" }
